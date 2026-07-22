@@ -103,7 +103,10 @@ SELECT *,
     ROUND((close_adjusted - min_low_20d) / close_adjusted * 100, 2) AS max_pct_down_20d,
     CASE WHEN max_high_10d >= close_adjusted * 1.10 THEN 1 ELSE 0 END AS hit_up_10pct_within_10d,
     CASE WHEN max_high_20d >= close_adjusted * 1.10 THEN 1 ELSE 0 END AS hit_up_10pct_within_20d,
-    CASE WHEN max_high_20d >= close_adjusted * 1.20 THEN 1 ELSE 0 END AS hit_up_20pct_within_20d
+    CASE WHEN max_high_20d >= close_adjusted * 1.20 THEN 1 ELSE 0 END AS hit_up_20pct_within_20d,
+    CASE WHEN min_low_10d <= close_adjusted * 0.90 THEN 1 ELSE 0 END AS hit_down_10pct_within_10d,
+    CASE WHEN min_low_20d <= close_adjusted * 0.90 THEN 1 ELSE 0 END AS hit_down_10pct_within_20d,
+    CASE WHEN min_low_20d <= close_adjusted * 0.80 THEN 1 ELSE 0 END AS hit_down_20pct_within_20d
 FROM price_path_forward
 """)
 print("price_move_thresholds view created.")
@@ -121,8 +124,16 @@ SELECT
     ROUND(SUM(hit_up_10pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_10pct_within_20d,
     SUM(hit_up_20pct_within_20d) AS events_hit_20pct_20d,
     ROUND(SUM(hit_up_20pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_20pct_within_20d,
+    SUM(hit_down_10pct_within_10d) AS events_hit_down10pct_10d,
+    ROUND(SUM(hit_down_10pct_within_10d) / COUNT(*) * 100, 1) AS pct_chance_down10pct_within_10d,
+    SUM(hit_down_10pct_within_20d) AS events_hit_down10pct_20d,
+    ROUND(SUM(hit_down_10pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_down10pct_within_20d,
+    SUM(hit_down_20pct_within_20d) AS events_hit_down20pct_20d,
+    ROUND(SUM(hit_down_20pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_down20pct_within_20d,
     ROUND(AVG(max_pct_up_10d), 2) AS avg_max_move_10d,
-    ROUND(AVG(max_pct_up_20d), 2) AS avg_max_move_20d
+    ROUND(AVG(max_pct_up_20d), 2) AS avg_max_move_20d,
+    ROUND(AVG(max_pct_down_10d), 2) AS avg_max_drop_10d,
+    ROUND(AVG(max_pct_down_20d), 2) AS avg_max_drop_20d
 FROM price_move_thresholds
 WHERE max_pct_up_20d IS NOT NULL
 GROUP BY spike_bucket
@@ -156,8 +167,13 @@ SELECT
     ROUND(SUM(hit_up_10pct_within_10d) / COUNT(*) * 100, 1) AS pct_chance_10pct_within_10d,
     ROUND(SUM(hit_up_10pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_10pct_within_20d,
     ROUND(SUM(hit_up_20pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_20pct_within_20d,
+    ROUND(SUM(hit_down_10pct_within_10d) / COUNT(*) * 100, 1) AS pct_chance_down10pct_within_10d,
+    ROUND(SUM(hit_down_10pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_down10pct_within_20d,
+    ROUND(SUM(hit_down_20pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_down20pct_within_20d,
     ROUND(AVG(max_pct_up_10d), 2) AS avg_max_move_10d,
-    ROUND(AVG(max_pct_up_20d), 2) AS avg_max_move_20d
+    ROUND(AVG(max_pct_up_20d), 2) AS avg_max_move_20d,
+    ROUND(AVG(max_pct_down_10d), 2) AS avg_max_drop_10d,
+    ROUND(AVG(max_pct_down_20d), 2) AS avg_max_drop_20d
 FROM volume_transitions
 WHERE max_pct_up_20d IS NOT NULL
 GROUP BY transition_type, spike_bucket
@@ -165,14 +181,15 @@ ORDER BY transition_type, spike_bucket
 """)
 print("transition_win_rate view created.")
 
-# Win rate summary: probability of hitting +10% / +20% within the window
+# Win rate summary: probability of hitting +10% / +20% AND -10% / -20% within the window
 cursor.execute("""
 SELECT spike_bucket, total_events,
     pct_chance_10pct_within_10d,
-    pct_chance_10pct_within_20d,
     pct_chance_20pct_within_20d,
+    pct_chance_down10pct_within_10d,
+    pct_chance_down20pct_within_20d,
     avg_max_move_10d,
-    avg_max_move_20d
+    avg_max_drop_10d
 FROM win_rate_summary
 ORDER BY spike_bucket
 """)
@@ -195,10 +212,9 @@ for row in cursor.fetchall():
 cursor.execute("""
 SELECT transition_type, spike_bucket, total_events,
     pct_chance_10pct_within_10d,
-    pct_chance_10pct_within_20d,
     pct_chance_20pct_within_20d,
-    avg_max_move_10d,
-    avg_max_move_20d
+    pct_chance_down10pct_within_10d,
+    pct_chance_down20pct_within_20d
 FROM transition_win_rate
 ORDER BY transition_type, spike_bucket
 """)
