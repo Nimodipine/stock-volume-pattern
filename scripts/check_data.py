@@ -36,8 +36,5 @@ for row in cursor.fetchall():
 cursor.execute("SELECT MIN(date), MAX(date), COUNT(*) FROM historical_prices")
 print(cursor.fetchone())
 
-cursor.execute("TRUNCATE TABLE historical_prices")
-print("Truncated historical_prices.")
-
 cursor.close()
 conn.close()
