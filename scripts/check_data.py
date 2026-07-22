@@ -25,9 +25,9 @@ for row in cursor.fetchall():
     print(row)
 
 cursor.execute("""
-    SELECT spike_bucket, COUNT(*) AS unchanged_count
-    FROM price_forward_returns
-    WHERE pct_change_5d = 0
+    SELECT spike_bucket, COUNT(*) AS flat_move_count
+    FROM price_move_thresholds
+    WHERE max_pct_up_10d = 0
     GROUP BY spike_bucket
 """)
 for row in cursor.fetchall():

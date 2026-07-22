@@ -58,6 +58,20 @@ except mysql.connector.Error as err:
     else:
         raise
 
+# --- Unique constraint so re-running fetch_historical.py upserts instead of
+# --- inserting duplicate rows for dates that already exist ---
+try:
+    cursor.execute("""
+        ALTER TABLE historical_prices
+        ADD UNIQUE KEY uniq_ticker_date (ticker, date)
+    """)
+    print("Added unique constraint on (ticker, date).")
+except mysql.connector.Error as err:
+    if err.errno == 1061:  # Duplicate key name (already exists)
+        print("Unique constraint already exists, skipping.")
+    else:
+        raise
+
 # --- Verify ---
 cursor.execute("SHOW TABLES")
 print(cursor.fetchall())

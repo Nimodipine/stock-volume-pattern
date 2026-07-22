@@ -18,6 +18,14 @@ def insert_historical(cursor, df):
             INSERT INTO historical_prices
             (ticker, date, open_price, high_price, low_price, close_raw, close_adjusted, volume, split_coefficient)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                open_price = VALUES(open_price),
+                high_price = VALUES(high_price),
+                low_price = VALUES(low_price),
+                close_raw = VALUES(close_raw),
+                close_adjusted = VALUES(close_adjusted),
+                volume = VALUES(volume),
+                split_coefficient = VALUES(split_coefficient)
         """, (
             SYMBOL,
             date.strftime("%Y-%m-%d"),

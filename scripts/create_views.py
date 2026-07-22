@@ -18,6 +18,9 @@ cursor = conn.cursor()
 cursor.execute("DROP VIEW IF EXISTS transition_win_rate")
 cursor.execute("DROP VIEW IF EXISTS volume_transitions")
 cursor.execute("DROP VIEW IF EXISTS win_rate_summary")
+cursor.execute("DROP VIEW IF EXISTS price_move_thresholds")
+cursor.execute("DROP VIEW IF EXISTS price_path_forward")
+# legacy views from the old point-in-time (5-day) approach - drop if present
 cursor.execute("DROP VIEW IF EXISTS price_forward_returns")
 cursor.execute("DROP VIEW IF EXISTS volume_spikes")
 cursor.execute("DROP VIEW IF EXISTS volume_with_rolling_avg")
@@ -60,17 +63,50 @@ SELECT *,
 FROM volume_with_rolling_avg
 """)
 
-# Forward returns (5 trading days later)
+# Path-based forward move: the highest high and lowest low reached over the
+# next 10 and next 20 trading days (~2 weeks and ~1 month). Using the daily
+# high/low (instead of just the closing price N days later) captures moves
+# that happen and reverse within the window, which matters a lot for a 3x
+# leveraged product like TQQQ.
 cursor.execute("""
-CREATE VIEW price_forward_returns AS
+CREATE VIEW price_path_forward AS
 SELECT *,
-    LEAD(close_adjusted, 5) OVER (PARTITION BY ticker ORDER BY date) AS price_5d_later,
-    ROUND(
-        (LEAD(close_adjusted, 5) OVER (PARTITION BY ticker ORDER BY date) - close_adjusted) / close_adjusted * 100,
-        2
-    ) AS pct_change_5d
+    MAX(high_price) OVER (
+        PARTITION BY ticker ORDER BY date
+        ROWS BETWEEN 1 FOLLOWING AND 10 FOLLOWING
+    ) AS max_high_10d,
+    MAX(high_price) OVER (
+        PARTITION BY ticker ORDER BY date
+        ROWS BETWEEN 1 FOLLOWING AND 20 FOLLOWING
+    ) AS max_high_20d,
+    MIN(low_price) OVER (
+        PARTITION BY ticker ORDER BY date
+        ROWS BETWEEN 1 FOLLOWING AND 10 FOLLOWING
+    ) AS min_low_10d,
+    MIN(low_price) OVER (
+        PARTITION BY ticker ORDER BY date
+        ROWS BETWEEN 1 FOLLOWING AND 20 FOLLOWING
+    ) AS min_low_20d
 FROM volume_spikes
 """)
+print("price_path_forward view created.")
+
+# Turn those extremes into pct-move figures and 10%/20% threshold hit flags.
+# (Built as a separate view since MySQL won't let a SELECT reuse a window
+# function's own alias in the same SELECT list for further math.)
+cursor.execute("""
+CREATE VIEW price_move_thresholds AS
+SELECT *,
+    ROUND((max_high_10d - close_adjusted) / close_adjusted * 100, 2) AS max_pct_up_10d,
+    ROUND((max_high_20d - close_adjusted) / close_adjusted * 100, 2) AS max_pct_up_20d,
+    ROUND((close_adjusted - min_low_10d) / close_adjusted * 100, 2) AS max_pct_down_10d,
+    ROUND((close_adjusted - min_low_20d) / close_adjusted * 100, 2) AS max_pct_down_20d,
+    CASE WHEN max_high_10d >= close_adjusted * 1.10 THEN 1 ELSE 0 END AS hit_up_10pct_within_10d,
+    CASE WHEN max_high_20d >= close_adjusted * 1.10 THEN 1 ELSE 0 END AS hit_up_10pct_within_20d,
+    CASE WHEN max_high_20d >= close_adjusted * 1.20 THEN 1 ELSE 0 END AS hit_up_20pct_within_20d
+FROM price_path_forward
+""")
+print("price_move_thresholds view created.")
 
 print("Views created successfully.")
 
@@ -79,14 +115,16 @@ CREATE VIEW win_rate_summary AS
 SELECT
     spike_bucket,
     COUNT(*) AS total_events,
-    SUM(CASE WHEN pct_change_5d > 0 THEN 1 ELSE 0 END) AS up_count,
-    SUM(CASE WHEN pct_change_5d < 0 THEN 1 ELSE 0 END) AS down_count,
-    ROUND(SUM(CASE WHEN pct_change_5d > 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_up,
-    ROUND(SUM(CASE WHEN pct_change_5d < 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_down,
-    ROUND(SUM(CASE WHEN pct_change_5d = 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_unchanged,
-    ROUND(AVG(pct_change_5d), 2) AS avg_pct_move
-FROM price_forward_returns
-WHERE pct_change_5d IS NOT NULL
+    SUM(hit_up_10pct_within_10d) AS events_hit_10pct_10d,
+    ROUND(SUM(hit_up_10pct_within_10d) / COUNT(*) * 100, 1) AS pct_chance_10pct_within_10d,
+    SUM(hit_up_10pct_within_20d) AS events_hit_10pct_20d,
+    ROUND(SUM(hit_up_10pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_10pct_within_20d,
+    SUM(hit_up_20pct_within_20d) AS events_hit_20pct_20d,
+    ROUND(SUM(hit_up_20pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_20pct_within_20d,
+    ROUND(AVG(max_pct_up_10d), 2) AS avg_max_move_10d,
+    ROUND(AVG(max_pct_up_20d), 2) AS avg_max_move_20d
+FROM price_move_thresholds
+WHERE max_pct_up_20d IS NOT NULL
 GROUP BY spike_bucket
 """)
 print("win_rate_summary view created.")
@@ -104,7 +142,7 @@ SELECT
         WHEN LAG(day_direction) OVER (PARTITION BY ticker ORDER BY date) = 'up' AND day_direction = 'down' THEN 'buy_to_sell'
         ELSE 'unchanged_or_na'
     END AS transition_type
-FROM price_forward_returns
+FROM price_move_thresholds
 """)
 print("volume_transitions view created.")
 
@@ -115,28 +153,27 @@ SELECT
     transition_type,
     spike_bucket,
     COUNT(*) AS total_events,
-    ROUND(SUM(CASE WHEN pct_change_5d > 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_up,
-    ROUND(SUM(CASE WHEN pct_change_5d < 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_down,
-    ROUND(AVG(pct_change_5d), 2) AS avg_pct_move
+    ROUND(SUM(hit_up_10pct_within_10d) / COUNT(*) * 100, 1) AS pct_chance_10pct_within_10d,
+    ROUND(SUM(hit_up_10pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_10pct_within_20d,
+    ROUND(SUM(hit_up_20pct_within_20d) / COUNT(*) * 100, 1) AS pct_chance_20pct_within_20d,
+    ROUND(AVG(max_pct_up_10d), 2) AS avg_max_move_10d,
+    ROUND(AVG(max_pct_up_20d), 2) AS avg_max_move_20d
 FROM volume_transitions
-WHERE pct_change_5d IS NOT NULL
+WHERE max_pct_up_20d IS NOT NULL
 GROUP BY transition_type, spike_bucket
 ORDER BY transition_type, spike_bucket
 """)
 print("transition_win_rate view created.")
 
-# Win rate summary (includes unchanged %)
+# Win rate summary: probability of hitting +10% / +20% within the window
 cursor.execute("""
-SELECT spike_bucket, COUNT(*) AS total_events,
-    SUM(CASE WHEN pct_change_5d > 0 THEN 1 ELSE 0 END) AS up_count,
-    SUM(CASE WHEN pct_change_5d < 0 THEN 1 ELSE 0 END) AS down_count,
-    ROUND(SUM(CASE WHEN pct_change_5d > 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_up,
-    ROUND(SUM(CASE WHEN pct_change_5d < 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_down,
-    ROUND(SUM(CASE WHEN pct_change_5d = 0 THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS pct_chance_unchanged,
-    ROUND(AVG(pct_change_5d), 2) AS avg_pct_move
-FROM price_forward_returns
-WHERE pct_change_5d IS NOT NULL
-GROUP BY spike_bucket
+SELECT spike_bucket, total_events,
+    pct_chance_10pct_within_10d,
+    pct_chance_10pct_within_20d,
+    pct_chance_20pct_within_20d,
+    avg_max_move_10d,
+    avg_max_move_20d
+FROM win_rate_summary
 ORDER BY spike_bucket
 """)
 
@@ -154,9 +191,14 @@ print("\nDay direction by spike bucket:")
 for row in cursor.fetchall():
     print(row)
 
-# --- NEW: transition win rate output ---
+# --- Transition win rate output ---
 cursor.execute("""
-SELECT transition_type, spike_bucket, total_events, pct_chance_up, pct_chance_down, avg_pct_move
+SELECT transition_type, spike_bucket, total_events,
+    pct_chance_10pct_within_10d,
+    pct_chance_10pct_within_20d,
+    pct_chance_20pct_within_20d,
+    avg_max_move_10d,
+    avg_max_move_20d
 FROM transition_win_rate
 ORDER BY transition_type, spike_bucket
 """)
